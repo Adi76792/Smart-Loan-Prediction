@@ -1,0 +1,154 @@
+### 1. Importing Libraries
+```python
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import confusion_matrix, accuracy_score, classification_report
+from sklearn.model_selection import train_test_split
+from imblearn.under_sampling import NearMiss
+from imblearn.over_sampling import RandomOverSampler
+from tensorflow import keras
+from tensorflow.keras import layers
+from keras_tuner.tuners import RandomSearch
+import pickle
+
+warnings.filterwarnings(action='ignore')
+```
+
+### 2. Reading and Preprocessing Data
+```python
+# Reading the dataset
+dataset_path ='/kaggle/input/lending-club-first-dataset/loan.csv'
+df_read = pd.read_csv(dataset_path, low_memory=False)
+
+# Dropping columns with more than 20% missing values
+percentage_missing = df_read.isnull().sum() / len(df_read) * 100
+features_to_keep = df_read.columns[(percentage_missing < 20)].to_list()
+df1 = df_read[features_to_keep]
+
+# Selecting relevant features for the analysis
+lucky_features = [
+    'loan_amnt', 'term', 'int_rate', 'installment', 'grade', 'sub_grade',
+    'emp_length', 'home_ownership', 'annual_inc', 'verification_status',
+    'purpose', 'dti', 'delinq_2yrs', 'inq_last_6mths', 'open_acc', 'pub_rec',
+    'revol_bal', 'revol_util', 'total_acc', 'last_pymnt_amnt', 'loan_status'
+]
+df = df1[lucky_features]
+
+# Filtering the dataset for only 'Fully Paid' and 'Charged Off' statuses
+target_loan = ["Fully Paid", "Charged Off"]
+df = df[df["loan_status"].isin(target_loan)]
+
+# Handling missing values
+df['emp_length'] = df['emp_length'].fillna(df['emp_length'].mode()[0])
+df['revol_util'] = df['revol_util'].fillna(df['revol_util'].median())
+```
+
+### 3. Data Transformation
+```python
+# Converting categorical columns to numerical
+df['term'] = df['term'].map(lambda x: x.rstrip(' months')).astype('int64')
+df['emp_length'] = df['emp_length'].str.replace(r'[a-zA-Z]', '').str.strip()
+df['grade'] = df['grade'].map({'A': 0, 'B': 1, 'C': 2, 'D': 3, 'E': 4, 'F': 5, 'G': 6})
+df['loan_status'] = df['loan_status'].map({'Fully Paid': 0, 'Charged Off': 1})
+
+# One-hot encoding for categorical variables
+df = pd.get_dummies(df, columns=['home_ownership', 'verification_status', 'purpose'], drop_first=True)
+
+# Splitting the dataset into features and target variable
+X = df.drop('loan_status', axis=1)
+y = df['loan_status']
+
+# Splitting into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=100)
+
+# Scaling the features
+scaler = MinMaxScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+```
+
+### 4. Handling Imbalanced Dataset
+#### Undersampling
+```python
+ns = NearMiss()
+X_train_ns, y_train_ns = ns.fit_resample(X_train, y_train)
+
+# Training a RandomForest model
+model1 = RandomForestClassifier()
+model1.fit(X_train_ns, y_train_ns)
+
+# Predictions and evaluation
+y_pred_ns = model1.predict(X_test)
+print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred_ns))
+print("Accuracy Score:\n", accuracy_score(y_test, y_pred_ns))
+print("Classification Report:\n", classification_report(y_test, y_pred_ns))
+```
+
+#### Oversampling
+```python
+os = RandomOverSampler()
+X_train_os, y_train_os = os.fit_resample(X_train, y_train)
+
+# Training a RandomForest model
+model2 = RandomForestClassifier()
+model2.fit(X_train_os, y_train_os)
+
+# Predictions and evaluation
+y_pred_os = model2.predict(X_test)
+print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred_os))
+print("Accuracy Score:\n", accuracy_score(y_test, y_pred_os))
+print("Classification Report:\n", classification_report(y_test, y_pred_os))
+```
+
+### 5. Model Training with Keras Tuner
+```python
+# Define the build_model function for Keras Tuner
+def build_model(hp):
+    model = keras.Sequential()
+    for i in range(hp.Int('num_layers', 2, 20)):
+        model.add(layers.Dense(units=hp.Int('units_' + str(i), min_value=32, max_value=512, step=32), activation='relu'))
+    model.add(layers.Dense(1, activation='sigmoid'))
+    model.compile(optimizer=keras.optimizers.Adam(hp.Choice('learning_rate', [1e-2, 1e-3, 1e-4])), loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+# Tuning hyperparameters with Keras Tuner
+tuner = RandomSearch(build_model, objective='val_accuracy', max_trials=3, executions_per_trial=2)
+tuner.search(X_train_os, y_train_os, epochs=10, validation_data=(X_test, y_test))
+best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+
+# Build the final model using the best hyperparameters
+num_nodes = [best_hps.get('units_' + str(i)) for i in range(best_hps.get('num_layers'))]
+
+def create_model(num_layers, num_nodes, activation):
+    model = keras.Sequential()
+    for i in range(num_layers):
+        if i == 0:
+            model.add(layers.Dense(num_nodes[i], input_dim=X_train.shape[1]))
+            model.add(layers.Activation(activation))
+            model.add(layers.Dropout(0.3))
+        else:
+            model.add(layers.Dense(num_nodes[i]))
+            model.add(layers.Activation(activation))
+            model.add(layers.Dropout(0.3))
+    model.add(layers.Dense(1, activation='sigmoid'))
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+# Training the final model
+model = keras.wrappers.scikit_learn.KerasClassifier(build_fn=create_model, num_layers=best_hps.get('num_layers'), num_nodes=num_nodes, activation='relu')
+mymodel = model.fit(X_train_os, y_train_os, epochs=20, validation_data=(X_test, y_test))
+```
+
+### 6. Model Evaluation
+```python
+y_pred = model.predict(X_test)
+y_pred = (y_pred > 0.5)
+
+print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+print("Accuracy Score:\n", accuracy_score(y_test, y_pred))
+print("Classification Report:\n", classification_report(y_test, y_pred))
+```
